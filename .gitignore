@@ -5,7 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+./data/sets
 # Distribution / packaging
 .Python
 build/
@@ -169,3 +169,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+.DS_Store
+data/sets/*
+data/pcd/*
