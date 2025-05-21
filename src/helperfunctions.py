@@ -7,88 +7,117 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.nuscenes import NuScenesExplorer
 
-def draw_registration_result(source, target, transformation):
-    """
-    Visualize the registration result of two point clouds.
+DATA_ROOT = '../../calibration_data/sets/v1.0-mini'
+def align_planes_using_normals(plane_model_lidar, plane_model_camera, lidar_points, camera_points):
+    
+    #Normals
+    #ax + by + cz + d = 0 (d offset, a,b,c normal)
+    n_lidar = np.array(plane_model_lidar[:3])
+    n_camera = np.array(plane_model_camera[:3])
 
-    This function takes two point clouds, applies a transformation to the source point cloud,
-    and visualizes both the transformed source and the target point clouds using Open3D.
+    # Normalize the normals
+    n_lidar /= np.linalg.norm(n_lidar)
+    n_camera /= np.linalg.norm(n_camera)
 
-    Parameters:
-    source (open3d.geometry.PointCloud): The source point cloud to be transformed and visualized.
-    target (open3d.geometry.PointCloud): The target point cloud to be visualized.
-    transformation (numpy.ndarray): A 4x4 transformation matrix to be applied to the source point cloud.
+    # Calculate the rotation matrix using Rodrigues' rotation formula
+    # R = I + sin(theta) * K + (1 - cos(theta)) * K^2
+    v = np.cross(n_camera, n_lidar)
+    s = np.linalg.norm(v) # sine
+    c = np.dot(n_camera, n_lidar) # cosine
 
-    Returns:
-    None
-    """
-    source_temp = copy.deepcopy(source)
-    target_temp = copy.deepcopy(target)
-    source_temp.paint_uniform_color([1, 0.706, 0])
-    target_temp.paint_uniform_color([0, 0.651, 0.929])
-    source_temp.transform(transformation)
-    o3d.visualization.draw_geometries([source_temp, target_temp])
+    if s < 1e-6:
+        R = np.eye(3)  
+    else:
+        vx = np.array([
+            [0, -v[2], v[1]],
+            [v[2], 0, -v[0]],
+            [-v[1], v[0], 0]
+        ])
+        R = np.eye(3) + vx + (vx @ vx) * ((1 - c) / (s ** 2))
 
+    centroid_lidar = np.mean(lidar_points, axis=0)
+    centroid_camera = np.mean(camera_points, axis=0)
 
-def preprocess_lidar_data(lt_pc):
-    """
-    Preprocesses LiDAR data from a given point cloud dictionary.
+    rotated_centroid_camera = R @ centroid_camera
+    # t = centroid_lidar - rotated_centroid_camera
+    t = [0, 0, 0]
 
-    This function reads a LiDAR point cloud file specified in the input dictionary,
-    extracts the x, y, z coordinates, and converts it into an Open3D PointCloud object.
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
 
-    Args:
-        lt_pc (dict): A dictionary containing LiDAR point cloud metadata. 
-                      It must include a 'filename' key with the path to the point cloud file.
+    return T
 
-    Returns:
-        o3d.geometry.PointCloud: An Open3D PointCloud object containing the processed point cloud data.
-    """
-    pc = LidarPointCloud.from_file(os.path.join(DATA_ROOT, lt_pc['filename']))
+def draw_registration_result(source, target, registration):
+    target.paint_uniform_color([0, 1, 0])
+    pcds = []
+
+    for src, reg in zip(source, registration):
+        source_copy = copy.deepcopy(src)
+        source_copy = source_copy.transform(np.linalg.inv(reg.transformation))
+        source_copy.paint_uniform_color([1, 0.0, 0.0])
+        pcds.append(source_copy)
+
+    pcds.append(target)
+    o3d.visualization.draw_geometries(pcds, point_show_normal=False)
+
+def detect_ground_plane(pcd, distance_threshold=0.1, ransac_n=3, num_iterations=1000):
+    plane_model, inliers = pcd.segment_plane(distance_threshold=distance_threshold,
+                                             ransac_n=ransac_n,
+                                             num_iterations=num_iterations)
+    
+    a, b, c, d = plane_model
+    print(f"Plane equation: {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0")
+
+    inlier_cloud = pcd.select_by_index(inliers)
+    inlier_cloud.paint_uniform_color([1.0, 0, 0])  # Red for the Ground Plane
+    outlier_cloud = pcd.select_by_index(inliers, invert=True)
+    outlier_cloud.paint_uniform_color([0, 1.0, 0]) # Green for the objects
+    o3d.visualization.draw_geometries([inlier_cloud, outlier_cloud])
+
+    return plane_model, inliers
+
+import time
+
+def animate_registration(source, target, transformations, wait=0.5):
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="ICP Progress")
+    # make a copy so we always have the original to re‐transform
+    src_original = source.clone()
+    vis.add_geometry(src_original)
+    vis.add_geometry(target)
+    for T in transformations:
+        src_original.transform(np.linalg.inv(T))
+        vis.update_geometry(src_original)
+        vis.poll_events()
+        vis.update_renderer()
+        time.sleep(wait)
+    vis.run()      # keep window alive at the end
+    vis.destroy_window()
+
+def preprocess_lidar_data(filename):
+    pc = LidarPointCloud.from_file(filename)
+    #pc.points = [[x1, x2, ...],[y1, y2, ...], [z1, z2, ...], [a1, a2, ...]]
     source_bin_pcd = pc.points.T
     # Reshape and get only x, y, z coordinates.
     source_bin_pcd = source_bin_pcd.reshape((-1, 4))[:, 0:3]
     o3d_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(source_bin_pcd))
     return o3d_pcd
 
-def execute_global_registration(source_down, target_down, source_fpfh,
-                                target_fpfh, voxel_size):
-    distance_threshold = voxel_size * 1.5
-    print(":: RANSAC registration on downsampled point clouds.")
-    print("   Since the downsampling voxel size is %.3f," % voxel_size)
-    print("   we use a liberal distance threshold %.3f." % distance_threshold)
-    result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-        source_down, target_down, source_fpfh, target_fpfh, True,
-        distance_threshold,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-        3, [
-            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(
-                0.9),
-            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(
-                distance_threshold)
-        ], o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999))
-    return result
-
 def create_point_cloud_from_depth(depth_image, intrinsic_matrix, lower_bound, upper_bound, voxel_size, edge_mask=[]):
     height, width = depth_image.shape
-
     depth_image = depth_image.astype(float)
     # Create a figure and axes
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))  # 1 row, 2 columns, adjust figsize as needed
 
+
+    depth_image[depth_image>upper_bound] = 0
+    # depth_image = depth_image/depth_image.max() * 255
     axes[0].imshow(depth_image, cmap='gray') # Add cmap for grayscale
     axes[0].set_title('Original Depth Image')
     axes[0].axis('off')  # Turn off axis labels
 
-    depth_image[edge_mask==255] = np.nan
-
-    # Display the second image with NaN values
-    axes[1].imshow(depth_image, cmap='gray')  # Add cmap for grayscale
-    axes[1].set_title('Edges Set to NaN')
-    axes[1].axis('off')  # Turn off axis labels
-
-    plt.tight_layout()
-    plt.show()
+    depth_image[edge_mask==255] = 0
 
     # Create a grid of pixel coordinates
     y, x = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
@@ -102,14 +131,11 @@ def create_point_cloud_from_depth(depth_image, intrinsic_matrix, lower_bound, up
     valid = ((depth > lower_bound) * (depth < upper_bound)) > 0
     x = x[valid]
     y = y[valid]
-
     depth = depth[valid]
-    
     
     # Back-project 2D points to 3D
     fx, fy = intrinsic_matrix[0][0], intrinsic_matrix[1][1]
     cx, cy = intrinsic_matrix[0][2], intrinsic_matrix[1][2]
-    
     x_3d = (x - cx) * depth / fx
     y_3d = (y - cy) * depth / fy
     z_3d = depth
@@ -121,14 +147,7 @@ def create_point_cloud_from_depth(depth_image, intrinsic_matrix, lower_bound, up
     if(voxel_size>0):
         pcd = pcd.voxel_down_sample(voxel_size = voxel_size)
         
-
     x_3d, y_3d, z_3d = np.array(pcd.points).T
-    # Visualization
-    fig = plt.figure(figsize=(12, 12))
-    ax = fig.add_subplot(projection='3d')
-    ax.scatter(x_3d, y_3d, z_3d, s=1)  # Small marker size for better visualization
-    plt.show()
-    
     return pcd
 
 
@@ -136,20 +155,12 @@ import numpy as np
 from typing import List, Tuple
 from nuscenes.utils.data_classes import LidarPointCloud
 
-def lidar_to_depth_image(nusc, pointsensor_token: str, camera_token: str, width: int, height: int) -> np.ndarray:
-    """
-    Projects LiDAR points to the image plane and generates a depth image.
-    
-    Args:
-        nusc (NuScenes): NuScenes dataset instance.
-        pointsensor_token (str): Token of the LiDAR sensor data.
-        camera_token (str): Token of the camera sensor data.
-        width (int): Image width.
-        height (int): Image height.
+#TODO : Read all the raw lidar points -> crop in some range -> trans_init referential -> lidar to camera calibration
+#     : Proper data loader -> all automated testing given one image 
+#     : Downsample the image point clouds -> what is the effect
+#     : Can we project lidar points to image, and associate 3d points to pixel? (lose normal estimation, have focal length as 1 param)
 
-    Returns:
-        np.ndarray: A (height, width) depth image where pixel values represent distance.
-    """
+def lidar_to_depth_image(nusc, pointsensor_token: str, camera_token: str, width: int, height: int) -> np.ndarray:
     # Map LiDAR to camera image
     nusc_explorer = NuScenesExplorer(nusc)
     points_2d, depths, im = nusc_explorer.map_pointcloud_to_image(
